@@ -304,7 +304,7 @@ textarea.inp{min-height:96px;resize:vertical}
 "use strict";
 (function(){
 const D = JSON.parse(document.getElementById('data').textContent);
-const VERSION = '7470eba43e', BUILT = '2026-09-27 22:15';
+const VERSION = '1cd86c72b5', BUILT = '2026-09-27 23:27';
 const Q = new URLSearchParams(location.search);
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
@@ -334,6 +334,7 @@ const IC = {
   walk:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="13" cy="4.5" r="1.8"/><path d="m9 21 2.5-6 2.5 2v4M8 12l2-4 4 1 2 3 2 1M11.5 15 10 8"/></svg>',
 };
 const TI = {
+  cal:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3.5" y="5" width="17" height="15" rx="3"/><path d="M8 3v4M16 3v4M3.5 10h17"/><path d="M12 13v3l2 1"/></svg>',
   hotel:IC.bed, road:IC.train, resv:IC.ticket,
   notes:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 3h9l4 4v14H6z"/><path d="M14 3v5h5M9 13h7M9 17h5"/></svg>',
   route:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="6" r="2.5"/><path d="M8.5 18H15a3 3 0 0 0 0-6H9a3 3 0 0 1 0-6h6.5"/></svg>',
@@ -377,7 +378,7 @@ const toMin = s => { const [h, m] = String(s).split(':').map(Number); return h *
 /* ------------------------------------------------------------ durum (localStorage + IndexedDB yedeği) */
 const LS_KEY = 'japonya.v1';
 const blank = () => ({v:1, prog:{}, shop:{}, seen:{}, resvDone:{}, edits:{moved:{}, deleted:{}, added:[]}, exp:[], rate:'', hotelInfo:{}, contacts:'',
-  settings:{theme:'auto', font:0, mode:'transit', pinHash:null}, lastExport:null, savedAt:0, prox:{}, geoOn:false, idbAt:0});
+  settings:{theme:'auto', font:0, mode:'transit', pinHash:null}, lastExport:null, savedAt:0, prox:{}, geoOn:false, idbAt:0, lists:[], lastTrain:{}, cal:{alarm:'important', presale:true}});
 function merge(base, x){ const o = Object.assign(blank(), x || {}); o.settings = Object.assign(blank().settings, (x || {}).settings || {}); o.edits = Object.assign(blank().edits, (x || {}).edits || {}); return o; }
 let S;
 try { S = merge(blank(), JSON.parse(localStorage.getItem(LS_KEY) || 'null')); } catch (e) { S = blank(); }
@@ -473,8 +474,10 @@ function nightOf(d){
   if (n.type === 'bus') return {type:'bus', dep:ACT[n.depId], arrive:n.arrive, arrivePlace:n.arrivePlace, label:d.nightLabel};
   return {type:'flight', act:ACT[n.actId]};
 }
-const hotelName = h => h ? h.name.replace(/\s*\((öneri|Male Only)\)\s*/gi, ' ').trim() : '';
-const hotelInfo = h => (S.hotelInfo[h.row] || {});
+const hotelInfo = h => (h && S.hotelInfo[h.row]) || {};
+const hotelName = h => h ? ((hotelInfo(h).name || '').trim() || h.name.replace(/\s*\((öneri|Male Only)\)\s*/gi, ' ').trim()) : '';
+const hotelLL = h => { const i = hotelInfo(h), la = parseFloat(String(i.lat || '').replace(',', '.')), ln = parseFloat(String(i.lng || '').replace(',', '.')); return !isNaN(la) && !isNaN(ln) ? [la, ln] : null; };
+const hotelPending = h => /öneri/i.test(h.name) && !hotelInfo(h).booked && !(hotelInfo(h).name || '').trim();
 
 /* ------------------------------------------------------------ konum */
 let POS = null, geoTimer = null, geoErr = null;
@@ -512,7 +515,8 @@ function dirUrl(a, mode){
   return 'https://www.google.com/maps/dir/?' + p.toString();
 }
 const mapUrl = a => safeUrl(a.url) || (a.lat != null ? `https://www.google.com/maps/search/?api=1&query=${a.lat},${a.lng}` : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(a.plan)}`);
-const hotelDest = h => h ? (h.q || hotelName(h)) : null;
+const hotelMapUrl = h => { const ll = hotelLL(h); if (ll) return `https://www.google.com/maps/search/?api=1&query=${ll.join(',')}`; if ((hotelInfo(h).name || '').trim()) return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(hotelInfo(h).name.trim())}`; return mapUrl({url:h.mapsUrl, plan:hotelName(h), lat:h.lat, lng:h.lng}); };
+const hotelDest = h => { if (!h) return null; const ll = hotelLL(h); if (ll) return ll.join(','); return (hotelInfo(h).name || '').trim() || h.q || hotelName(h); };
 
 /* ------------------------------------------------------------ genel durum hesabı */
 function situation(t){
@@ -586,6 +590,104 @@ function foodFor(ds, meal){
   return scored.map(x => x.f);
 }
 
+/* ------------------------------------------------------------ Excel notlarından: kapanış / teyit uyarıları, fiyat, açılış saati */
+const WARN_KINDS = [
+  ['kapali', /kapal[ıi]|kapan[ıi]r|kapanabilir|kapanış/i, '⛔', 'Kapanış'],
+  ['teyit', /teyit|doğrula|garanti değil/i, '❗', 'Teyit et'],
+  ['bilet', /önceden bilet|saatli bilet|rezervasyon öneril|slotu/i, '🎫', 'Önceden bilet'],
+];
+const sentencesOf = t => String(t || '').replace(/([.!?])\s+/g, '$1\n').split('\n').map(x => x.trim()).filter(Boolean);
+const _wcache = new Map();
+function warningsOf(a){
+  const key = a.plan + '\u0001' + (a.note || '');
+  if (_wcache.has(key)) return _wcache.get(key);
+  const out = [];
+  sentencesOf(a.note).forEach(sn => { const k = WARN_KINDS.find(w => w[1].test(sn)); if (k) out.push({k:k[0], ic:k[2], lbl:k[3], txt:sn}); });
+  _wcache.set(key, out); return out;
+}
+function factsOf(a){
+  const n = a.note || '', f = [];
+  const prices = n.match(/~?\s?\d{1,3}(?:[.,]\d{3})*(?:\s?[–-]\s?\d{1,3}(?:[.,]\d{3})*)?\s?¥/g) || [];
+  Array.from(new Set(prices.map(x => x.replace(/\s+/g, '')))).slice(0, 3).forEach(x => f.push({ic:'💴', txt:x}));
+  const re = /(\d{1,2}[:.]\d{2})[’']?\s?(?:d[ae]|t[ae])?\s+açıl|açılış[ıi]?\s+(\d{1,2}[:.]\d{2})|(\d{1,2}[:.]\d{2})\s+açılış/gi; let m;
+  while ((m = re.exec(n))) f.push({ic:'🕘', txt:(m[1] || m[2] || m[3]).replace('.', ':') + ' açılış'});
+  return f;
+}
+function factsHtml(a){
+  const f = factsOf(a), info = (S.prog[a.id] || {}).info || {};
+  const mine = [];
+  if (info.hours) mine.push(`<span class="chip info">🕘 ${esc(info.hours)}</span>`);
+  if (info.price) mine.push(`<span class="chip info">💴 ${esc(info.price)}</span>`);
+  if (!f.length && !mine.length) return '';
+  return `<div class="chips">${f.map(x => `<span class="chip" title="Excel notundan">${x.ic} ${esc(x.txt)}</span>`).join('')}${mine.join('')}</div>`;
+}
+function dayWarnings(d, onlyPending){
+  return liveActs(d).filter(a => !onlyPending || !stOf(a.id)).flatMap(a => warningsOf(a).map(w => Object.assign({a}, w)));
+}
+function warnListHtml(ws){
+  return ws.map(w => `<button class="item" data-a="open" data-id="${esc(w.a.id)}" style="all:unset;cursor:pointer;display:block;width:100%;padding:8px 0;border-bottom:1px solid var(--line)"><span class="chip ${w.k === 'kapali' ? 'bad' : w.k === 'teyit' ? 'rz' : 'info'}">${w.ic} ${esc(w.lbl)}</span> <b class="small">${esc(w.a.s)} ${esc(w.a.plan)}</b><div class="small" style="margin-top:2px">${esc(w.txt)}</div></button>`).join('');
+}
+
+/* ------------------------------------------------------------ son tren (kullanıcı girer) */
+function lastTrainOf(ds){ const v = (S.lastTrain || {})[ds]; if (!v) return null; let m = toMin(v); if (m < DAY_CUTOFF) m += 1440; return {t:v, m}; }
+
+/* ------------------------------------------------------------ takvim (.ics) */
+const icsEsc = s => String(s == null ? '' : s).replace(/\\/g, '\\\\').replace(/;/g, '\\;').replace(/,/g, '\\,').replace(/\r?\n/g, '\\n');
+function icsFold(line){ const enc = new TextEncoder(); let out = '', n = 0; for (const ch of line) { const b = enc.encode(ch).length; if (n + b > 73) { out += '\r\n '; n = 1; } out += ch; n += b; } return out; }
+const icsDT = t => { const d = new Date(t); return `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}00Z`; };
+const isImportant = a => a.rz || /GECE OTOBÜSÜ|uçuş|havalimanı|check-out|Narita|valizi al/i.test(a.plan) || warningsOf(a).some(w => w.k === 'bilet');
+const TRMON = {Ekim:10, Kasım:11, Aralık:12};
+function presaleEvents(){
+  const out = [], first = PLAN[0].date;
+  D.resv.forEach(r => {
+    const t = r.todo || '';
+    const re = /(\d{1,2})\s+(Ekim|Kasım|Aralık)(?:\s+(\d{4}))?(?:\s+(\d{1,2})[.:](\d{2})\s*JST)?/g; let m;
+    while ((m = re.exec(t))) {
+      const ds = `2026-${pad(TRMON[m[2]])}-${pad(+m[1])}`;
+      if (ds >= first) continue;
+      out.push({r, ds, time:m[4] ? `${pad(+m[4])}:${m[5]}` : null, approx:/civar/i.test(t.slice(m.index, m.index + 40))});
+    }
+    if (/~\s?1 ay önce/.test(t) && r.date) out.push({r, ds:addDays(r.date, -30), time:null, approx:true, derived:'Excel: “~1 ay önce” → tahmini tarih'});
+  });
+  return out;
+}
+function buildICS(){
+  const opt = S.cal || {}, stamp = icsDT(Date.now());
+  const L_ = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Japonya Seyahat Asistani//TR', 'CALSCALE:GREGORIAN', 'METHOD:PUBLISH', 'X-WR-CALNAME:Japonya 2026', 'X-WR-TIMEZONE:Asia/Tokyo'];
+  const alarm = (min, txt) => ['BEGIN:VALARM', 'ACTION:DISPLAY', `TRIGGER:-PT${min}M`, 'DESCRIPTION:' + icsEsc(txt), 'END:VALARM'];
+  let n = 0;
+  PLAN.forEach(d => liveActs(d).forEach(a => {
+    const imp = isImportant(a), ws = warningsOf(a);
+    const desc = [a.note, ws.length ? 'Dikkat: ' + ws.map(w => w.txt).join(' ') : '', a.tz || '', 'Google Maps: ' + mapUrl(a), a.added ? '(Benim eklediğim durak)' : ''].filter(Boolean).join('\n');
+    L_.push('BEGIN:VEVENT', 'UID:' + a.id + '@japonya-seyahat', 'DTSTAMP:' + stamp, 'DTSTART:' + icsDT(aStart(a)), 'DTEND:' + icsDT(aEnd(a)),
+      'SUMMARY:' + icsEsc((imp ? '⚠︎ ' : '') + a.plan), 'LOCATION:' + icsEsc(a.stopName || qText(a) || ''), 'DESCRIPTION:' + icsEsc(desc), 'URL:' + mapUrl(a));
+    if (opt.alarm === 'all') L_.push(...alarm(imp ? 60 : 15, a.plan));
+    else if ((opt.alarm || 'important') === 'important' && imp) L_.push(...alarm(60, a.plan));
+    L_.push('END:VEVENT'); n++;
+  }));
+  Object.keys(S.lastTrain || {}).forEach(ds => { const lt = lastTrainOf(ds); if (!lt) return; const t = dayStart(ds) + lt.m * MIN;
+    L_.push('BEGIN:VEVENT', `UID:son-tren-${ds}@japonya-seyahat`, 'DTSTAMP:' + stamp, 'DTSTART:' + icsDT(t - 5 * MIN), 'DTEND:' + icsDT(t), 'SUMMARY:' + icsEsc('🚃 Son tren ' + lt.t), 'DESCRIPTION:' + icsEsc('Kendi girdiğin son tren saati.'), ...alarm(45, 'Son trene 45 dk'), 'END:VEVENT'); n++; });
+  if (opt.presale !== false) presaleEvents().forEach(ev => {
+    const nx = addDays(ev.ds, 1).replace(/-/g, '');
+    const head = ['BEGIN:VEVENT', `UID:satis-${ev.r.id}-${ev.ds}@japonya-seyahat`, 'DTSTAMP:' + stamp];
+    const when = ev.time ? ['DTSTART:' + icsDT(dayStart(ev.ds) + toMin(ev.time) * MIN), 'DTEND:' + icsDT(dayStart(ev.ds) + (toMin(ev.time) + 30) * MIN)] : ['DTSTART;VALUE=DATE:' + ev.ds.replace(/-/g, ''), 'DTEND;VALUE=DATE:' + nx];
+    const al = ev.time ? alarm(30, 'Satış açılıyor: ' + ev.r.name) : ['BEGIN:VALARM', 'ACTION:DISPLAY', 'TRIGGER:PT9H', 'DESCRIPTION:' + icsEsc('Satış kontrolü: ' + ev.r.name), 'END:VALARM'];
+    L_.push(...head, ...when, 'SUMMARY:' + icsEsc(`🎫 Bilet satışı${ev.approx ? ' (tahmini)' : ''}: ${ev.r.name}`), 'DESCRIPTION:' + icsEsc([ev.r.todo, ev.derived || '', ev.r.url || ''].filter(Boolean).join('\n')), ...(ev.r.url ? ['URL:' + ev.r.url] : []), ...al, 'END:VEVENT'); n++;
+  });
+  L_.push('END:VCALENDAR');
+  return {text:L_.map(icsFold).join('\r\n') + '\r\n', n};
+}
+function exportICS(share){
+  const {text, n} = buildICS();
+  const blob = new Blob([text], {type:'text/calendar;charset=utf-8'}), name = 'japonya-plan.ics';
+  const file = typeof File === 'function' ? new File([blob], name, {type:'text/calendar'}) : null;
+  if (share && file && navigator.canShare && navigator.canShare({files:[file]})) { navigator.share({files:[file], title:name}).catch(() => {}); }
+  else if (/iPhone|iPad|iPod/i.test(navigator.userAgent) && !share) { location.href = URL.createObjectURL(blob); }
+  else { const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); setTimeout(() => a.remove(), 1500); }
+  S.calAt = Date.now(); save(); toast(`${n} etkinlik hazırlandı`);
+}
+window.__ics = () => buildICS();
+
 /* ------------------------------------------------------------ yardımcı: rozetler */
 function badges(a){
   const b = [];
@@ -597,6 +699,7 @@ function badges(a){
   if (a.added) b.push('<span class="chip info">Eklediğim durak</span>');
   if (a.edited) b.push('<span class="chip info">Değiştirildi</span>');
   if (docsFor(a.id).length) b.push('<span class="chip info">🎫 Bilet/belge</span>');
+  warningsOf(a).filter((w, i, arr) => arr.findIndex(x => x.k === w.k) === i).forEach(w => b.push(`<span class="chip ${w.k === 'kapali' ? 'bad' : w.k === 'teyit' ? 'rz' : 'info'}">${w.ic} ${esc(w.lbl)}</span>`));
   return b.length ? `<div class="chips">${b.join('')}</div>` : '';
 }
 const statusChip = s => {
@@ -661,6 +764,7 @@ function vNow(){
   h += `<div class="daybanner city-${city}"><div class="num"><b>${dsParts(d.date).d}</b><span>${MON[dsParts(d.date).mo - 1]}</span></div>
     <div style="min-width:0"><div class="eyebrow" style="margin:0;color:var(--c)"><span class="dot"></span>${esc(CITY_TR[city])} · ${s.di + 1}. gün</div>
     <h2 class="serif">${esc(d.title)}</h2>${d.highlights ? `<div class="muted small">${esc(d.highlights)}</div>` : ''}</div></div>`;
+  h += lastTrainAlert(s);
   h += heroCard(s);
   h += nextCard(s);
   h += scheduleCard(s);
@@ -668,6 +772,7 @@ function vNow(){
   h += tonightCard(s);
   h += foodSuggestCard(s);
   h += reservationsCard(s);
+  h += warningsCard(s);
   h += '<div id="wxslot"></div>';
   h += `<button class="btn block" data-a="safe" style="margin-bottom:12px;min-height:56px">${IC.share}Güvendeyim — konumumu ve planımı paylaş</button>`;
   h += daySummaryCard(s);
@@ -691,7 +796,7 @@ function heroCard(s){
     const isBus = /GECE OTOBÜSÜ/.test(a.plan);
     return `<section class="card hero city-${isBus ? 'bus' : city}">
       <div class="between"><div class="eyebrow"><span class="dot"></span>Şu an</div><div class="small muted bigtime">${esc(a.s)}–${esc(a.e || '')}</div></div>
-      <h1 class="serif">${esc(a.plan)}</h1>${badges(a)}
+      <h1 class="serif">${esc(a.plan)}</h1>${badges(a)}${factsHtml(a)}
       <div class="bar"><i style="width:${pct.toFixed(0)}%"></i></div>
       <div class="between small"><span><b class="bigtime">${fmtDur(rem)}</b> kaldı</span><span class="muted">bitiş ${fmtM(a.em)}${a.em >= 1440 ? ' (+1)' : ''}</span></div>
       ${a.tz ? `<div class="infobox">${esc(a.tz)}</div>` : ''}
@@ -736,7 +841,7 @@ function nextCard(s){
   const km = distTo(n);
   return `<section class="card">
     <div class="between"><div class="eyebrow">${tomorrow ? 'Yarın ilk durak' : 'Sıradaki'} · ${esc(n.s)}</div><div class="small muted">${fmtDur(inMin)} sonra</div></div>
-    <h2 class="serif" style="font-size:1.2rem">${esc(n.plan)}</h2>${badges(n)}
+    <h2 class="serif" style="font-size:1.2rem">${esc(n.plan)}</h2>${badges(n)}${factsHtml(n)}
     ${n.note ? `<div class="transit">${IC.train}<div><b>Ulaşım / yapılacak</b>${esc(n.note)}</div></div>` : ''}
     ${km != null ? `<div class="small" style="margin-top:6px">Buradan: <span class="dist">${distLabel(km)}</span></div>` : ''}
     <div class="btns2"><a class="btn primary" href="${esc(dirUrl(n, 'transit'))}" target="_blank" rel="noopener">${IC.go}Buradan sıradaki durağa git</a>
@@ -793,12 +898,14 @@ function tonightCard(s){
   if (nt.type === 'hotel') {
     const h = nt.h, info = hotelInfo(h);
     const change = prev && prev.type === 'hotel' && prev.h.row !== h.row ? `<div class="warnbox">🔁 <b>Bugün otel değişimi:</b> ${esc(hotelName(prev.h))} → ${esc(hotelName(h))}</div>` : '';
-    const pending = /öneri/i.test(h.name) ? '<span class="chip rz">öneri — rezervasyonu teyit et</span>' : '';
+    const pending = hotelPending(h) ? '<span class="chip rz">öneri — rezervasyonu teyit et</span>' : hotelInfo(h).booked ? '<span class="chip ok">rezervasyon tamam</span>' : '';
     return `<section class="card"><div class="eyebrow">${IC.bed.replace('<svg', '<svg width="16" height="16"')} Bu gece · <span class="nc">${esc(nt.label || '')}</span></div>
       <h2>${esc(hotelName(h))}</h2><div class="chips">${pending}</div><div class="small muted" style="margin-top:4px">${esc(h.area || '')}</div>
       ${info.address ? `<div class="small" style="margin-top:6px">${esc(info.address)}</div>` : ''}${change}
       <div class="btns2"><a class="btn primary" href="${esc(dirUrl(hotelDest(h), 'transit'))}" target="_blank" rel="noopener">${IC.bed}Otele dön</a>
-      <button class="btn" data-a="taxi">${IC.taxi}Taksi kartı</button></div></section>`;
+      <button class="btn" data-a="taxi">${IC.taxi}Taksi kartı</button></div>
+      <div class="grid2" style="margin-top:10px;align-items:end"><div><label class="f" style="margin-top:0">Otele son tren (kendin gir)</label><input class="inp" type="time" data-lt="${d.date}" value="${esc((S.lastTrain || {})[d.date] || '')}"></div>
+      <div class="tiny muted">Google Maps → otele yol tarifi → “Kalkış saati” → <b>Son</b>. Saati buraya yaz; 90 dk kala uyarırım.</div></div></section>`;
   }
   if (nt.type === 'bus') {
     const dep = nt.dep;
@@ -832,6 +939,19 @@ function reservationsCard(s){
   if (!items.length) return '';
   return `<section class="card flat"><div class="eyebrow">Rezervasyon / teyit gerekenler</div>${items.map(i => `<div class="item"><span class="chip ${i.lbl === 'Bugün' ? 'rz' : ''}" style="margin-bottom:4px">${i.lbl}</span>${i.html}</div>`).join('')}
     <button class="btn sm ghost" data-a="go" data-to="diger/rezervasyonlar">Tüm rezervasyonlar</button></section>`;
+}
+function warningsCard(s){
+  const today = dayWarnings(s.day, true).filter(w => w.a.em > s.nm), tom = PLAN[s.di + 1] ? dayWarnings(PLAN[s.di + 1]) : [];
+  if (!today.length && !tom.length) return '';
+  return `<section class="card flat" style="border-color:color-mix(in srgb,var(--bad) 35%,var(--line))"><div class="eyebrow">Kapanış / teyit / bilet uyarıları <span class="nc muted">(Excel notlarından)</span></div>
+    ${today.length ? `<div class="small muted" style="margin-top:4px"><b>Bugün kalanlar</b></div>${warnListHtml(today)}` : ''}${tom.length ? `<div class="small muted" style="margin-top:10px"><b>Yarın</b></div>${warnListHtml(tom)}` : ''}</section>`;
+}
+function lastTrainAlert(s){
+  const lt = lastTrainOf(s.ds); if (!lt) return '';
+  const left = lt.m - s.nm; if (left > 90 || left < -60) return '';
+  const nt = nightOf(s.day);
+  return `<div class="card" style="border-color:var(--bad);background:var(--bad-soft)"><b>🚃 ${left >= 0 ? `Son trene ${fmtDur(left)} kaldı (${esc(lt.t)})` : `Son tren (${esc(lt.t)}) kaçmış olabilir`}</b><div class="small">${left >= 0 ? 'İstasyona doğru yola çıkmayı düşün.' : 'Taksi kartını kullanabilirsin.'}</div>
+    <div class="btns2"><a class="btn sm primary" href="${esc(dirUrl(nt && nt.h ? hotelDest(nt.h) : s.next, 'transit'))}" target="_blank" rel="noopener">${IC.go}Otele yol tarifi</a><button class="btn sm" data-a="taxi">${IC.taxi}Taksi kartı</button></div></div>`;
 }
 function daySummaryCard(s){
   if (!(s.state === 'after' || s.nm >= 20 * 60)) return '';
@@ -905,6 +1025,8 @@ function vPlan(){
     <div class="bar"><i style="width:${live.length ? done / live.length * 100 : 0}%"></i></div><div class="tiny muted">${done}/${live.length} işaretlendi</div>
     <div class="linklist" style="margin-top:6px">${(d.routes || []).map(r => safeUrl(r.url) ? `<a href="${esc(r.url)}" target="_blank" rel="noopener">${TI.route.replace('<svg', '<svg width="20" height="20"')}${esc(r.label === 'Günün rotası' ? 'Günün rotası (Google Maps)' : r.label + ' (Google Maps)')}</a>` : '').join('')}</div>
     <div class="row" style="margin-top:4px"><button class="btn sm" data-a="go" data-to="harita/${ds}">${IC.pin}Haritada gör</button><button class="btn sm" data-a="add-stop" data-d="${ds}">${IC.plus}Durak ekle</button></div></section>`;
+  const dws = dayWarnings(d);
+  if (dws.length) h += `<details class="card flat" style="border-color:color-mix(in srgb,var(--bad) 35%,var(--line))"><summary style="font-weight:700;min-height:40px;display:flex;align-items:center">⚠︎ Bu günün uyarıları (${dws.length}) — kapanış, teyit, bilet</summary>${warnListHtml(dws)}</details>`;
   h += `<section class="card" style="padding-top:4px;padding-bottom:4px"><div class="acts">${acts.filter(a => !isAlt(a)).map(a => actRow(a, {now:cur && cur.id === a.id, near:a.id === nearId})).join('') || '<p class="muted">Bu gün için aktivite yok.</p>'}</div></section>`;
   const alts = acts.filter(isAlt);
   if (alts.length) h += `<div class="sec-title">Alternatif plan</div><section class="card flat" style="padding-top:4px;padding-bottom:4px"><div class="acts">${alts.map(a => actRow(a, {})).join('')}</div></section>`;
@@ -922,7 +1044,7 @@ function actRow(a, o){
     <div class="t"><b>${esc(a.s)}</b><span>${esc(a.e || '')}${a.em >= 1440 && !a.tz ? ' +1' : ''}</span></div>
     <div><button class="open" data-a="open" data-id="${esc(a.id)}"><h3><span class="st">${st === 'done' ? IC.check.replace('<svg', '<svg width="14" height="14"') : st === 'skip' ? '–' : ''}</span><span class="ttl">${esc(a.plan)}</span></h3></button>
       ${o.now ? '<div class="nearbadge" style="color:var(--accent)">● şu an</div>' : ''}${o.near && km != null ? `<div class="nearbadge">📍 en yakın durak · ${fmtKm(km)}</div>` : ''}
-      ${badges(a)}${a.note ? `<p class="note">${esc(a.note)}</p>` : ''}${a.tz ? `<p class="note tiny">🕒 ${esc(a.tz)}</p>` : ''}
+      ${badges(a)}${factsHtml(a)}${a.note ? `<p class="note">${esc(a.note)}</p>` : ''}${a.tz ? `<p class="note tiny">🕒 ${esc(a.tz)}</p>` : ''}
       ${p.note ? `<div class="mynote">📝 ${esc(p.note)}</div>` : ''}${p.here ? `<div class="tiny muted" style="margin-top:4px">📍 Buradaydım · ${fmtDT(p.here.t)}</div>` : ''}
       <div class="ab"><button class="btn ${st === 'done' ? '' : 'okline'}" data-a="done" data-id="${esc(a.id)}" aria-pressed="${st === 'done'}">${IC.check}Yapıldı</button>
         <button class="btn skip" data-a="skip" data-id="${esc(a.id)}" aria-pressed="${st === 'skip'}">Atla</button>
@@ -1056,8 +1178,9 @@ function vFood(){
 
 /* ============================================================ LİSTE */
 function vList(){
-  const tab = ROUTE.a === 'gorulecek' ? 'gorulecek' : 'al';
-  let h = `<h1 class="pagetitle serif">Listeler</h1><div class="seg"><button data-a="go" data-to="liste/al" aria-pressed="${tab === 'al'}">Alınacaklar</button><button data-a="go" data-to="liste/gorulecek" aria-pressed="${tab === 'gorulecek'}">Görülecekler</button></div>`;
+  const tab = ROUTE.a === 'gorulecek' || ROUTE.a === 'benim' ? ROUTE.a : 'al';
+  let h = `<h1 class="pagetitle serif">Listeler</h1><div class="seg"><button data-a="go" data-to="liste/al" aria-pressed="${tab === 'al'}">Alınacaklar</button><button data-a="go" data-to="liste/gorulecek" aria-pressed="${tab === 'gorulecek'}">Görülecekler</button><button data-a="go" data-to="liste/benim" aria-pressed="${tab === 'benim'}">Listelerim</button></div>`;
+  if (tab === 'benim') return h + myListsHtml();
   if (tab === 'al') {
     const n = D.buy.filter(b => S.shop[b.id]).length;
     h += `<div class="between"><span class="small muted">${esc(D.buyMeta.note || '')}</span></div><div class="bar"><i style="width:${n / D.buy.length * 100}%;background:var(--ok)"></i></div><div class="small" style="margin-bottom:8px"><b>${n}/${D.buy.length}</b> alındı</div>`;
@@ -1075,19 +1198,31 @@ function vList(){
   return h;
 }
 
+function myListsHtml(){
+  const L_ = S.lists || [];
+  return `${L_.length ? '' : '<p class="small muted">Excel\'de olmayan kendi listelerin: bavul, hediye alınacak kişiler, yapılacaklar… Sadece bu cihazda saklanır, yedeğe dahildir.</p>'}
+    ${L_.map(l => { const done = l.items.filter(i => i.done).length; return `<section class="card" id="list-${esc(l.id)}"><div class="between"><h2>${esc(l.name)}</h2><span class="small muted">${done}/${l.items.length}</span></div>
+      ${l.items.map(i => `<div class="item check ${i.done ? 'on' : ''}" style="grid-template-columns:44px 1fr auto;align-items:center"><input type="checkbox" data-a="li-toggle" data-l="${esc(l.id)}" data-id="${esc(i.id)}" ${i.done ? 'checked' : ''} aria-label="${esc(i.text)}"><h3 style="font-weight:600">${esc(i.text)}</h3><button class="btn sm ghost" data-a="li-del" data-l="${esc(l.id)}" data-id="${esc(i.id)}" aria-label="Sil">${IC.x}</button></div>`).join('')}
+      <div class="row" style="margin-top:10px;flex-wrap:nowrap"><input class="inp" id="li-in-${esc(l.id)}" data-li-add="${esc(l.id)}" placeholder="Yeni madde ekle" enterkeyhint="done" style="flex:1"><button class="btn" data-a="li-add" data-l="${esc(l.id)}" aria-label="Ekle">${IC.plus}</button></div>
+      <div class="row" style="margin-top:8px"><button class="btn sm ghost" data-a="li-clear" data-l="${esc(l.id)}">İşaretlileri temizle</button><button class="btn sm ghost danger" data-a="list-del" data-l="${esc(l.id)}">Listeyi sil</button></div></section>`; }).join('')}
+    <section class="card flat"><div class="eyebrow">Yeni liste</div><div class="row" style="flex-wrap:nowrap"><input class="inp" id="list-new" placeholder="ör. Bavul" style="flex:1"><button class="btn primary" data-a="list-new">${IC.plus}Oluştur</button></div>
+    ${L_.length ? '' : `<div class="row" style="margin-top:8px"><button class="btn sm" data-a="list-new" data-v="Bavul">+ Bavul</button><button class="btn sm" data-a="list-new" data-v="Hediye alınacaklar">+ Hediye alınacaklar</button><button class="btn sm" data-a="list-new" data-v="Yola çıkmadan">+ Yola çıkmadan</button></div>`}</section>`;
+}
+function listAdd(lid){ const inp = document.getElementById('li-in-' + lid); const v = (inp && inp.value || '').trim(); if (!v) return; const l = S.lists.find(x => x.id === lid); l.items.push({id:uid(), text:v, done:false}); save(); const y = scrollY; render(); scrollTo(0, y); const n = document.getElementById('li-in-' + lid); if (n) n.focus(); }
+
 /* ============================================================ DİĞER */
 const MORE = [
   ['oteller', 'Oteller', 'seçilen / iptal', TI.hotel], ['ulasim', 'Ulaşım notları', 'hat, bilet, süre', TI.road],
   ['rezervasyonlar', 'Rezervasyonlar', 'durum rozetleri', TI.resv], ['notlar', 'Pratik notlar', 'nakit, IC kart, priz…', TI.notes],
   ['belgeler', 'Belgeler', 'bilet, QR, pasaport', TI.docs], ['harcama', 'Harcamalar', 'yen + TL', TI.money],
-  ['gunluk', 'Hatıra günlüğü', 'günlük özet, dışa aktar', TI.diary], ['hava', 'Hava durumu', '3 günlük tahmin', TI.wx],
+  ['takvim', 'Takvime aktar', 'hatırlatmalar (.ics)', TI.cal], ['gunluk', 'Hatıra günlüğü', 'günlük özet, dışa aktar', TI.diary], ['hava', 'Hava durumu', '3 günlük tahmin', TI.wx],
   ['rotalar', 'Günlük rotalar', 'Google Maps linkleri', TI.route], ['taksi', 'Taksi / yardım kartı', 'Japonca cümleler', TI.phrase],
   ['acil', 'Acil durum', '110 · 119 · oteller', TI.sos], ['degisiklik', 'Plan değişikliklerim', 'taşı, sil, ekle', TI.edits],
   ['ayarlar', 'Ayarlar ve yedek', 'tema, yazı, PIN, JSON', TI.gear],
 ];
 function vMore(){
   const sub = ROUTE.a;
-  const fn = {oteller:vHotels, ulasim:vTransport, rezervasyonlar:vResv, notlar:vNotes, belgeler:vDocs, harcama:vExp, gunluk:vDiary, hava:vWeather, rotalar:vRoutes, taksi:vTaxiPage, acil:vSos, degisiklik:vEdits, ayarlar:vSettings}[sub];
+  const fn = {oteller:vHotels, ulasim:vTransport, rezervasyonlar:vResv, notlar:vNotes, belgeler:vDocs, harcama:vExp, gunluk:vDiary, takvim:vCal, hava:vWeather, rotalar:vRoutes, taksi:vTaxiPage, acil:vSos, degisiklik:vEdits, ayarlar:vSettings}[sub];
   if (fn) { const t = MORE.find(m => m[0] === sub); return `<button class="back" data-a="go" data-to="diger">${IC.back}Diğer</button><h1 class="pagetitle serif">${esc(t[1])}</h1>` + fn(); }
   return `<h1 class="pagetitle serif">Diğer</h1><div class="tiles">${MORE.map(m => `<button class="tile" data-a="go" data-to="diger/${m[0]}">${m[3]}<div><b>${m[1]}</b><br><span>${m[2]}</span></div></button>`).join('')}</div>
     <p class="tiny muted" style="text-align:center;margin-top:18px">Sürüm ${VERSION} · derleme ${BUILT}</p>`;
@@ -1097,13 +1232,18 @@ function vHotels(){
   return `<p class="small muted">${esc(D.hotelMeta.note || '')}</p>` + D.hotels.map(h => {
     const info = hotelInfo(h);
     return `<section class="card" id="hotel-${h.row}" style="${h.status === 'iptal' ? 'opacity:.75' : ''}"><div class="between"><span class="chip">${esc(h.label)}</span>${h.selected && h.status !== 'secilen' ? '<span class="chip ok">konaklama planında</span>' : byStatus[h.status] || ''}</div>
-      <h2 style="margin-top:8px;${h.status === 'iptal' ? 'text-decoration:line-through' : ''}">${esc(h.name)}</h2>
+      <h2 style="margin-top:8px;${h.status === 'iptal' ? 'text-decoration:line-through' : ''}">${esc(info.name && info.name.trim() ? info.name.trim() : h.name)}</h2>${info.name && info.name.trim() ? `<div class="small muted">Excel'de: ${esc(h.name)} · değiştirdin</div>` : ''}${info.booked ? '<span class="chip ok">rezervasyon tamam</span>' : ''}
       <dl class="kv"><dt>Giriş</dt><dd>${fmtDay(h.checkin)}</dd><dt>Çıkış</dt><dd>${fmtDay(h.checkout)}</dd><dt>Gece</dt><dd>${h.nights}</dd><dt>Bölge</dt><dd>${esc(h.area || '')}</dd></dl>
       ${h.why ? `<p class="note">${esc(h.why)}</p>` : ''}${h.note ? `<div class="warnbox small">${esc(h.note)}</div>` : ''}
       <div class="small muted" style="margin-top:6px">Kaynak: ${esc(h.source || '—')}</div>
       <div class="row" style="margin-top:8px">${h.mapsUrl ? linkBtn(h.mapsUrl, 'Google Maps') : ''}${linkBtn(h.url, 'Resmî site')}</div>
       ${h.status !== 'iptal' ? `<details style="margin-top:10px"><summary class="small" style="font-weight:700;min-height:40px;display:flex;align-items:center">Adres / Japonca ad / telefon (yalnızca bu cihazda) ${info.address || info.jp ? '✓' : ''}</summary>
         <div class="small muted">Excel'de adres yok. Rezervasyon onayından kopyala; taksi ve acil kartında görünür.</div>
+        ${h.selected ? `<label class="check" style="margin-top:10px;grid-template-columns:44px 1fr;align-items:center"><input type="checkbox" data-hotel="${h.row}" data-k="booked" ${info.booked ? 'checked' : ''}><span class="small"><b>Rezervasyon tamam</b> (“öneri” rozetini kaldırır)</span></label>
+        <label class="f">Farklı bir otel ayırttıysan: yeni otelin adı</label><input class="inp" data-hotel="${h.row}" data-k="name" value="${esc(info.name || '')}" placeholder="${esc(hotelName(Object.assign({}, h, {row:-1})))}">
+        <div class="grid2"><div><label class="f">Enlem (isteğe bağlı)</label><input class="inp" data-hotel="${h.row}" data-k="lat" inputmode="decimal" value="${esc(info.lat || '')}"></div><div><label class="f">Boylam</label><input class="inp" data-hotel="${h.row}" data-k="lng" inputmode="decimal" value="${esc(info.lng || '')}"></div></div>
+        <div class="tiny muted">Konum boşsa “Otele dön” Google Maps'te otelin adını arar. Konumu Google Maps'te otelin üzerine basılı tutup kopyalayabilirsin (ör. 35.6857, 139.7005) veya otelde “Buradaki konumu kullan”a bas.</div>
+        <button class="btn sm" data-a="hotel-here" data-id="${h.row}" style="margin-top:6px">${IC.here}Buradaki konumu kullan</button>` : ''}
         <label class="f">Japonca adı</label><input class="inp" data-hotel="${h.row}" data-k="jp" value="${esc(info.jp || '')}" placeholder="Rezervasyondan ekle">
         <label class="f">Adres (Japonca tercih edilir)</label><textarea class="inp" data-hotel="${h.row}" data-k="address" placeholder="Rezervasyondan ekle">${esc(info.address || '')}</textarea>
         <label class="f">Telefon</label><input class="inp" data-hotel="${h.row}" data-k="phone" inputmode="tel" value="${esc(info.phone || '')}" placeholder="Rezervasyondan ekle">
@@ -1167,6 +1307,21 @@ function vDiary(){
     <div class="btns2"><button class="btn primary" data-a="diary-txt">Metin olarak (.txt)</button><button class="btn" data-a="diary-json">JSON olarak</button></div></section>`
     + PLAN.map(d => `<div class="sec-title">${fmtDay(d.date, true)} · ${esc(d.title)}</div><section class="card flat">${daySummaryHtml(d)}${liveActs(d).filter(a => (S.prog[a.id] || {}).here).map(a => `<div class="tiny muted">📍 ${esc(a.plan)} — ${fmtDT(S.prog[a.id].here.t)} (${S.prog[a.id].here.lat.toFixed(5)}, ${S.prog[a.id].here.lng.toFixed(5)})</div>`).join('')}</section>`).join('');
 }
+function vCal(){
+  const c = S.cal || {}, ps = presaleEvents(), all = PLAN.flatMap(liveActs), imp = all.filter(isImportant);
+  return `<section class="card flat"><div class="small">Planın telefonunun takvimine eklenir. Uygulama kapalıyken de <b>telefonun kendi takvimi</b> hatırlatır. Saatler Japonya saatine göre yazılır; telefon hangi saat diliminde olursa olsun doğru anda çalar.</div></section>
+    <section class="card"><div class="eyebrow">Hatırlatmalar</div><div class="seg">${[['none', 'Yok'], ['important', 'Önemliler'], ['all', 'Hepsi']].map(([k, l]) => `<button data-a="cal-alarm" data-v="${k}" aria-pressed="${(c.alarm || 'important') === k}">${l}</button>`).join('')}</div>
+      <div class="tiny muted">“Önemliler” (60 dk önce): rezervasyon/teyit gerekenler, gece otobüsü, uçuş, check-out, saatli biletler — ${imp.length} etkinlik. “Hepsi”: diğerlerine de 15 dk önce.</div>
+      <label class="check" style="margin-top:12px;grid-template-columns:44px 1fr;align-items:center"><input type="checkbox" data-a="cal-presale-c" ${c.presale !== false ? 'checked' : ''}><span class="small"><b>Bilet satış açılışı hatırlatmaları</b> (Excel'deki tarihlerden, ${ps.length} adet)</span></label>
+      ${ps.length ? `<div class="stack" style="margin-top:6px">${ps.map(e => `<div class="small">🎫 ${fmtDay(e.ds)}${e.time ? ' ' + e.time + ' JST' : ''} · <b>${esc(e.r.name)}</b>${e.approx ? ' <span class="chip rz">tahmini</span>' : ''}${e.derived ? `<div class="tiny muted">${esc(e.derived)}</div>` : ''}</div>`).join('')}</div>` : ''}
+      <div class="tiny muted" style="margin-top:6px">Toplam: ${all.length} aktivite${Object.keys(S.lastTrain || {}).length ? ` + ${Object.keys(S.lastTrain).length} son tren` : ''}${c.presale !== false ? ` + ${ps.length} satış hatırlatması` : ''}. Plan değişikliklerin ve eklediğin duraklar dahil.</div>
+      <div class="btns2"><button class="btn primary" data-a="ics">Takvime ekle (.ics)</button><button class="btn" data-a="ics-share">Dosyayı paylaş / kaydet</button></div>
+      ${S.calAt ? `<div class="tiny muted" style="margin-top:6px">Son aktarım: ${ago(S.calAt)}</div>` : ''}</section>
+    <section class="card flat small"><div class="eyebrow">Nasıl eklenir?</div>
+      <p><b>iPhone:</b> “Takvime ekle”ye bas → açılan pencerede <b>Tümünü Ekle</b>. İstersen önce Takvim uygulamasında “Japonya” adlı bir takvim oluştur ve onu seç; plan değişirse o takvimi silip yeniden eklemek en kolayı. Açılmazsa “Dosyayı paylaş / kaydet” → Takvim.</p>
+      <p><b>Android:</b> dosya iner → dosyaya dokun → Takvim uygulamasıyla aç (Samsung Takvim doğrudan açar). Google Takvim uygulaması dosya içe almaz; bilgisayarda calendar.google.com → Ayarlar → İçe/Dışa aktar'dan yükle.</p>
+      <p class="muted">Aynı dosyayı iki kez eklersen etkinlikler çift görünebilir. Planı değiştirdiysen önce eskileri sil.</p></section>`;
+}
 function vWeather(){ return '<div id="wxslot"><p class="muted small">Tahmin yükleniyor… (internet gerekir)</p></div><p class="tiny muted">Kaynak: Open-Meteo (anahtarsız, ücretsiz). Konumun açıksa bulunduğun yer, değilse günün şehri kullanılır.</p>'; }
 function vDocs(){
   return `<section class="card flat" style="border-color:var(--info);background:var(--info-soft)"><div class="small"><b>Gizlilik:</b> Belgeler yalnızca bu cihazın tarayıcı veritabanında (IndexedDB) saklanır. Sayfaya gömülmez, hiçbir sunucuya yüklenmez, JSON yedeğine de dahil edilmez.</div></section>
@@ -1229,7 +1384,7 @@ function openTaxi(){
     ${info.address ? `<div style="font-size:1.6rem;font-weight:700;margin-top:12px;white-space:pre-line">${esc(info.address)}</div>` : h ? `<div class="warnbox" style="color:#111">Adres yok — Excel'de adres bulunmuyor. <b>Diğer → Oteller</b>'de rezervasyondan adresi ekle.</div>` : ''}
     ${info.phone ? `<div style="font-size:1.3rem;margin-top:10px">☎︎ <a href="tel:${esc(info.phone)}" style="color:inherit">${esc(info.phone)}</a></div>` : ''}
     ${h ? `<div class="small" style="margin-top:12px;opacity:.8">${esc(h.area || '')}</div>` : ''}
-    <div class="btns2" style="margin-top:20px">${h ? `<a class="btn" href="${esc(mapUrl({url:h.mapsUrl, plan:hotelName(h), lat:h.lat, lng:h.lng}))}" target="_blank" rel="noopener">${IC.pin}Haritada göster</a>` : ''}<button class="btn" data-a="go" data-to="diger/taksi">Japonca cümleler</button></div>`, true);
+    <div class="btns2" style="margin-top:20px">${h ? `<a class="btn" href="${esc(hotelMapUrl(h))}" target="_blank" rel="noopener">${IC.pin}Haritada göster</a>` : ''}<button class="btn" data-a="go" data-to="diger/taksi">Japonca cümleler</button></div>`, true);
 }
 function vSos(){
   return sosHtml();
@@ -1285,6 +1440,7 @@ function searchIndex(){
   D.resv.forEach(r => I.push({t:'Rezervasyon', title:r.name, sub:r.status, text:Object.values(r).join(' '), to:'diger/rezervasyonlar', flash:'resv-' + r.id}));
   D.practical.forEach(n => I.push({t:'Not', title:n.topic, sub:'Pratik notlar', text:n.topic + ' ' + n.text, to:'diger/notlar', flash:'note-' + n._row}));
   D.tokyoNotes.forEach(n => I.push({t:'Not', title:n.name, sub:n.label, text:[n.label, n.name, n.text].join(' '), to:'diger/rezervasyonlar'}));
+  (S.lists || []).forEach(l => l.items.forEach(i => I.push({t:'Listem', title:i.text, sub:l.name, text:i.text + ' ' + l.name, to:'liste/benim', flash:'list-' + l.id})));
   I.forEach(x => { x.n = norm(x.text + ' ' + x.title); });
   return I;
 }
@@ -1317,6 +1473,10 @@ function openAct(id){
     ${st ? `<div class="okbox small">${st === 'done' ? '✔ Yapıldı' : '⏭ Atlandı'} · ${fmtDT(p.t)}</div>` : ''}${p.here ? `<div class="small muted" style="margin-top:6px">📍 Buradaydım: ${fmtDT(p.here.t)} · ${p.here.lat.toFixed(5)}, ${p.here.lng.toFixed(5)}</div>` : ''}
     ${actButtons(a, {more:false})}
     <label class="f">Notum</label><textarea class="inp" id="act-note" placeholder="Bu durakla ilgili notun…">${esc(p.note || '')}</textarea>
+    <div class="grid2"><div><label class="f">Açılış–kapanış (kendi notun)</label><input class="inp" data-pinfo="${esc(a.id)}" data-k="hours" value="${esc((p.info || {}).hours || '')}" placeholder="ör. 09:00–17:00"></div>
+      <div><label class="f">Ücret (kendi notun)</label><input class="inp" data-pinfo="${esc(a.id)}" data-k="price" value="${esc((p.info || {}).price || '')}" placeholder="ör. 500¥"></div></div>
+    ${factsOf(a).length ? `<div class="tiny muted" style="margin-top:4px">Excel notunda: ${factsOf(a).map(f => f.ic + ' ' + esc(f.txt)).join(' · ')}</div>` : ''}
+    <div class="tiny muted">Resmî saat/ücret için yerin Google Maps sayfasına veya resmî sitesine bak; yılbaşı döneminde değişebilir.</div>
     <button class="btn sm" data-a="note-save" data-id="${esc(a.id)}" style="margin-top:8px">Notu kaydet</button>
     <div class="btns2"><a class="btn" href="${esc(mapUrl(a))}" target="_blank" rel="noopener">${IC.pin}Google Maps'te aç</a><button class="btn" data-a="here" data-id="${esc(a.id)}">${IC.here}Buradayım (konum+saat)</button>
       <a class="btn" href="${esc(dirUrl(a, 'transit'))}" target="_blank" rel="noopener">${IC.train}Yol tarifi · toplu taşıma</a><a class="btn" href="${esc(dirUrl(a, 'walking'))}" target="_blank" rel="noopener">${IC.walk}Yol tarifi · yürüyüş</a></div>
@@ -1530,6 +1690,15 @@ document.addEventListener('click', e => {
     case 'map-list': mapFallback(); break;
     case 'map-back': $('#mapfb').classList.add('hide'); break;
     case 'map-retry': MAP.failed = false; ensureMap(); break;
+    case 'hotel-here': geoOnce().then(p => { S.hotelInfo[id] = Object.assign({}, S.hotelInfo[id] || {}, {lat:p.lat.toFixed(6), lng:p.lng.toFixed(6)}); save(); render(); toast('Otel konumu kaydedildi'); }).catch(() => toast('Konum alınamadı')); break;
+    case 'list-new': { const name = (t.dataset.v || ($('#list-new') && $('#list-new').value) || '').trim(); if (!name) { toast('Liste adı gir'); return; } S.lists.push({id:uid(), name, items:[]}); save(); render(); break; }
+    case 'list-del': { const l = S.lists.find(x => x.id === t.dataset.l); if (l && confirm(`“${l.name}” listesi silinsin mi?`)) { S.lists = S.lists.filter(x => x !== l); save(); render(); } break; }
+    case 'li-add': listAdd(t.dataset.l); break;
+    case 'li-del': { const l = S.lists.find(x => x.id === t.dataset.l); l.items = l.items.filter(i => i.id !== id); save(); const y = scrollY; render(); scrollTo(0, y); break; }
+    case 'li-clear': { const l = S.lists.find(x => x.id === t.dataset.l); l.items = l.items.filter(i => !i.done); save(); render(); break; }
+    case 'ics': exportICS(false); break;
+    case 'ics-share': exportICS(true); break;
+    case 'cal-alarm': S.cal = Object.assign({}, S.cal, {alarm:t.dataset.v}); save(); render(); break;
     case 'add-stop': openAddStop(t.dataset.d); break;
     case 'ad-here': geoOnce().then(p => { $('#ad-lat').value = p.lat.toFixed(6); $('#ad-lng').value = p.lng.toFixed(6); }).catch(() => toast('Konum alınamadı')); break;
     case 'ad-save': addStop(); break;
@@ -1560,17 +1729,21 @@ document.addEventListener('click', e => {
 document.addEventListener('change', e => {
   const t = e.target;
   if (t.dataset.a === 'shop') { if (t.checked) S.shop[t.dataset.id] = Date.now(); else delete S.shop[t.dataset.id]; save(); t.closest('.check').classList.toggle('on', t.checked); updateListBar(); }
+  if (t.dataset.a === 'cal-presale-c') { S.cal = Object.assign({}, S.cal, {presale:t.checked}); save(); render(); }
+  if (t.dataset.a === 'li-toggle') { const l = S.lists.find(x => x.id === t.dataset.l); const i = l.items.find(x => x.id === t.dataset.id); i.done = t.checked; save(); t.closest('.check').classList.toggle('on', t.checked); }
   if (t.dataset.a === 'seen') { if (t.checked) S.seen[t.dataset.id] = Date.now(); else delete S.seen[t.dataset.id]; save(); t.closest('.check').classList.toggle('on', t.checked); }
   if (t.dataset.a === 'food-day') { FOOD_F.day = t.value; render(); }
   if (t.dataset.a === 'import' && t.files[0]) importJSON(t.files[0]);
+  if (t.dataset.lt) { if (t.value) S.lastTrain[t.dataset.lt] = t.value; else delete S.lastTrain[t.dataset.lt]; save(); toast(t.value ? 'Son tren kaydedildi: ' + t.value : 'Son tren silindi'); }
   if (t.id === 'ex-rate') { S.rate = t.value.trim(); save(); render(); }
 });
 document.addEventListener('input', e => {
   const t = e.target;
-  if (t.dataset.hotel) { const r = t.dataset.hotel; S.hotelInfo[r] = Object.assign({}, S.hotelInfo[r] || {}, {[t.dataset.k]:t.value}); save(); }
+  if (t.dataset.hotel) { const r = t.dataset.hotel; S.hotelInfo[r] = Object.assign({}, S.hotelInfo[r] || {}, {[t.dataset.k]:t.type === 'checkbox' ? t.checked : t.value}); save(); }
   if (t.id === 'contacts') { S.contacts = t.value; save(); }
+  if (t.dataset.pinfo) { const id = t.dataset.pinfo, p = S.prog[id] || (S.prog[id] = {}); p.info = Object.assign({}, p.info || {}, {[t.dataset.k]:t.value.trim()}); if (!p.info.hours && !p.info.price) delete p.info; p.snap = snapOf(ACT[id]); if (!p.st && !p.note && !p.here && !p.info) delete S.prog[id]; save(); }
 });
-document.addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.id === 'pinin') $('[data-a="unlock"]').click(); if (e.key === 'Escape') { closeSheet(); closeFull(); } });
+document.addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.dataset && e.target.dataset.liAdd) { e.preventDefault(); listAdd(e.target.dataset.liAdd); } if (e.key === 'Enter' && e.target.id === 'list-new') $('[data-a="list-new"]').click(); if (e.key === 'Enter' && e.target.id === 'pinin') $('[data-a="unlock"]').click(); if (e.key === 'Escape') { closeSheet(); closeFull(); } });
 function updateListBar(){ if (ROUTE.tab === 'liste') { const y = scrollY; render(); scrollTo(0, y); } }
 
 function setStatus(id, s){
@@ -1578,7 +1751,7 @@ function setStatus(id, s){
   const p = S.prog[id] || (S.prog[id] = {});
   if (p.st === s) { delete p.st; delete p.t; } else { p.st = s; p.t = now(); }
   p.snap = snapOf(a);
-  if (!p.st && !p.note && !p.here) delete S.prog[id];
+  if (!p.st && !p.note && !p.here && !p.info) delete S.prog[id];
   save();
   if (navigator.vibrate) try { navigator.vibrate(12); } catch (e) {}
   toast(p.st === 'done' ? `✔ ${a.plan}` : p.st === 'skip' ? `Atlandı: ${a.plan}` : 'İşaret kaldırıldı');
