@@ -2,7 +2,7 @@
  * Sürüm build.py tarafından her derlemede değiştirilir; tarayıcı yeni sw.js'i görünce
  * yeni önbelleği hazırlar, sayfa "Güncelleme var" der. localStorage / IndexedDB'ye DOKUNULMAZ.
  */
-const VERSION = '1cd86c72b5';
+const VERSION = '9216ae60b9';
 const APP_CACHE = 'japonya-app-' + VERSION;
 const TILE_CACHE = 'japonya-tiles';           // sürümden bağımsız: gezdiğin bölgeler kalır
 const MAX_TILES = 1500;                        // eski karolar bu sayının üstünde silinir
